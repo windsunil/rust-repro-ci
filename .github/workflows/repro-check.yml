@@ -29,11 +29,9 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # Persistent state directory on the self-hosted runner
   STATE_DIR: /opt/gh-runner/.repro-check-state
   WORKSPACE: /tmp/rust-repro-${{ github.run_id }}
-  REPRO_REPO: https://github.com/windsunil/rust-ReproCheckTool.git
-  REPRO_BRANCH: reprocheck-tool
+  PR_DIFF_URL: https://github.com/rust-lang/rust/pull/149888.diff
 
 jobs:
   repro-check:
@@ -92,42 +90,39 @@ jobs:
           echo "Upstream HEAD: $SHA"
 
       # ------------------------------------------------------------
-      # 4. Apply your repro-check patch cleanly
+      # 4. Apply repro-check patch from PR #149888
       # ------------------------------------------------------------
       - name: Apply repro-check patch from PR
         run: |
           cd "$WORKSPACE"
-          git remote add windsunil "$REPRO_REPO"
-          git fetch windsunil "$REPRO_BRANCH" --depth=1
+          echo "Downloading PR #149888 diff..."
+          curl -L -o /tmp/repro-check.patch "$PR_DIFF_URL"
 
-          PR_COMMIT=$(git rev-parse windsunil/$REPRO_BRANCH)
-          echo "pr_commit=$PR_COMMIT" >> $GITHUB_ENV
-          echo "PR commit: $PR_COMMIT"
+          if [[ ! -s /tmp/repro-check.patch ]]; then
+            echo "::error::Failed to download PR diff. PR may have been closed or GitHub is unreachable."
+            exit 1
+          fi
 
-          # METHOD 1: Cherry-pick (best for new files, handles renames)
-          echo "Trying cherry-pick..."
-          if git cherry-pick --no-commit "$PR_COMMIT"; then
-            echo "::notice::Patch applied via cherry-pick"
-            echo "patch_method=cherry-pick" >> $GITHUB_ENV
+          echo "Patch file size: $(wc -c < /tmp/repro-check.patch) bytes"
+
+          echo "Trying to apply patch..."
+          if git apply --check /tmp/repro-check.patch 2>/dev/null; then
+            git apply /tmp/repro-check.patch
+            echo "::notice::Patch applied successfully"
+            echo "patch_method=pr-diff" >> $GITHUB_ENV
           else
-            git cherry-pick --abort 2>/dev/null || true
-            git reset --hard HEAD
-            git clean -ffdx
-
-            # METHOD 2: Generate diff and apply (fallback)
-            echo "Trying diff apply..."
-            git diff --full-index --binary "HEAD...windsunil/$REPRO_BRANCH" > /tmp/repro.patch
-            if [[ -s /tmp/repro.patch ]] && git apply /tmp/repro.patch; then
-              echo "::notice::Patch applied via diff"
-              echo "patch_method=diff-apply" >> $GITHUB_ENV
+            echo "::warning::Direct apply failed. Trying with 3-way merge..."
+            if git apply --3way /tmp/repro-check.patch; then
+              echo "::notice::Patch applied with 3-way merge"
+              echo "patch_method=pr-diff-3way" >> $GITHUB_ENV
             else
-              echo "::error::FAILED to apply repro-check patch."
-              echo "The PR branch may need rebasing on top of upstream."
+              echo "::error::FAILED to apply PR #149888 patch to current upstream main."
+              echo "The PR has merge conflicts and needs rebasing by the author."
+              echo ""
+              echo "To fix this, the PR branch must be rebased on top of rust-lang/rust:main"
               exit 1
             fi
           fi
-
-          git remote remove windsunil
 
       # ------------------------------------------------------------
       # 5. Configure build (toggle CI LLVM)
