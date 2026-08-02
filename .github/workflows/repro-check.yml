@@ -223,7 +223,7 @@ jobs:
             exit 1
           fi
           BIN=$(realpath "$BIN")
-          echo "repro_bin=$BIN" >> $GITHUB_ENV
+          echo "REPRO_BIN=$BIN" >> $GITHUB_ENV
           echo "Found binary: $BIN"
 
       # ------------------------------------------------------------
