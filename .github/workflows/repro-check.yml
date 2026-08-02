@@ -30,7 +30,7 @@ concurrency:
 
 env:
   # Persistent state directory on the self-hosted runner
-  STATE_DIR: /home/ghrunner/.repro-check-state
+  STATE_DIR: /opt/gh-runner/.repro-check-state
   WORKSPACE: /tmp/rust-repro-${{ github.run_id }}
   REPRO_REPO: https://github.com/windsunil/rust-ReproCheckTool.git
   REPRO_BRANCH: reprocheck-tool
