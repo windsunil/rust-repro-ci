@@ -1,0 +1,452 @@
+name: Rust Reproducibility Check
+
+on:
+  # Nightly at 2:00 AM UTC
+  schedule:
+    - cron: '0 2 * * *'
+
+  # Manual trigger with options
+  workflow_dispatch:
+    inputs:
+      upstream-ref:
+        description: 'Upstream branch or tag to test (e.g. main, 1.79.0)'
+        required: true
+        default: 'main'
+      download-ci-llvm:
+        description: 'Use CI LLVM? (false = build LLVM locally, very slow)'
+        type: choice
+        options: ['true', 'false']
+        default: 'true'
+      enable-bisect:
+        description: 'Run git bisect if reproducibility fails?'
+        type: choice
+        options: ['true', 'false']
+        default: 'true'
+
+# Prevent multiple runs from clashing on the same self-hosted runner
+concurrency:
+  group: repro-check-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  # Persistent state directory on the self-hosted runner
+  STATE_DIR: /home/ghrunner/.repro-check-state
+  WORKSPACE: /tmp/rust-repro-${{ github.run_id }}
+  REPRO_REPO: https://github.com/windsunil/rust-ReproCheckTool.git
+  REPRO_BRANCH: reprocheck-tool
+
+jobs:
+  repro-check:
+    name: Check Reproducibility
+    runs-on: [self-hosted, repro-check]
+    timeout-minutes: 600   # 10 hours max
+
+    steps:
+      # ------------------------------------------------------------
+      # 1. Checkout THIS repo (to get helper scripts if needed)
+      # ------------------------------------------------------------
+      - name: Checkout CI repo
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------------------
+      # 2. Read last known good commit from persistent state file
+      # ------------------------------------------------------------
+      - name: Read state (last good commit)
+        id: state
+        run: |
+          mkdir -p "$STATE_DIR"
+          STATE_FILE="$STATE_DIR/last-good.json"
+          if [[ -f "$STATE_FILE" ]]; then
+            LAST_GOOD=$(jq -r '.sha // empty' "$STATE_FILE")
+            LAST_DATE=$(jq -r '.timestamp // "unknown"' "$STATE_FILE")
+            echo "last_good=$LAST_GOOD" >> $GITHUB_OUTPUT
+            echo "last_date=$LAST_DATE" >> $GITHUB_OUTPUT
+            echo "Found last good: $LAST_GOOD ($LAST_DATE)"
+          else
+            echo "No previous good run found."
+            echo "last_good=" >> $GITHUB_OUTPUT
+            echo "last_date=" >> $GITHUB_OUTPUT
+          fi
+
+      # ------------------------------------------------------------
+      # 3. Clone upstream Rust at the requested ref
+      # ------------------------------------------------------------
+      - name: Clone upstream rust-lang/rust
+        id: upstream
+        run: |
+          REF="${{ inputs.upstream-ref || 'main' }}"
+          echo "Testing upstream ref: $REF"
+
+          git clone \
+            --branch "$REF" \
+            --single-branch \
+            https://github.com/rust-lang/rust.git \
+            "$WORKSPACE"
+
+          cd "$WORKSPACE"
+          SHA=$(git rev-parse HEAD)
+          SHORT=$(git rev-parse --short HEAD)
+          echo "upstream_sha=$SHA" >> $GITHUB_ENV
+          echo "upstream_short=$SHORT" >> $GITHUB_ENV
+          echo "upstream_ref=$REF" >> $GITHUB_ENV
+          echo "Upstream HEAD: $SHA"
+
+      # ------------------------------------------------------------
+      # 4. Apply your repro-check patch cleanly
+      # ------------------------------------------------------------
+      - name: Apply repro-check patch from PR
+        run: |
+          cd "$WORKSPACE"
+          git remote add windsunil "$REPRO_REPO"
+          git fetch windsunil "$REPRO_BRANCH" --depth=1
+
+          PR_COMMIT=$(git rev-parse windsunil/$REPRO_BRANCH)
+          echo "pr_commit=$PR_COMMIT" >> $GITHUB_ENV
+          echo "PR commit: $PR_COMMIT"
+
+          # METHOD 1: Cherry-pick (best for new files, handles renames)
+          echo "Trying cherry-pick..."
+          if git cherry-pick --no-commit "$PR_COMMIT"; then
+            echo "::notice::Patch applied via cherry-pick"
+            echo "patch_method=cherry-pick" >> $GITHUB_ENV
+          else
+            git cherry-pick --abort 2>/dev/null || true
+            git reset --hard HEAD
+            git clean -ffdx
+
+            # METHOD 2: Generate diff and apply (fallback)
+            echo "Trying diff apply..."
+            git diff --full-index --binary "HEAD...windsunil/$REPRO_BRANCH" > /tmp/repro.patch
+            if [[ -s /tmp/repro.patch ]] && git apply /tmp/repro.patch; then
+              echo "::notice::Patch applied via diff"
+              echo "patch_method=diff-apply" >> $GITHUB_ENV
+            else
+              echo "::error::FAILED to apply repro-check patch."
+              echo "The PR branch may need rebasing on top of upstream."
+              exit 1
+            fi
+          fi
+
+          git remote remove windsunil
+
+      # ------------------------------------------------------------
+      # 5. Configure build (toggle CI LLVM)
+      # ------------------------------------------------------------
+      - name: Configure compiler profile
+        run: |
+          cd "$WORKSPACE"
+          ./x.py setup compiler
+          echo "========== bootstrap.toml (initial) =========="
+          cat bootstrap.toml
+          echo "=============================================="
+
+          # If user selected local LLVM, patch the config
+          if [[ "${{ inputs.download-ci-llvm || 'true' }}" == "false" ]]; then
+            echo "Switching to LOCAL LLVM build (slow)..."
+            if grep -q "download-ci-llvm" bootstrap.toml 2>/dev/null; then
+              sed -i 's/download-ci-llvm = true/download-ci-llvm = false/' bootstrap.toml
+            else
+              echo -e "\n[llvm]\ndownload-ci-llvm = false\n" >> bootstrap.toml
+            fi
+            # Also patch the tool's internal default
+            sed -i 's/download-ci-llvm = true/download-ci-llvm = false/' \
+              src/tools/repro-check/src/config.rs 2>/dev/null || true
+            echo "========== bootstrap.toml (patched) =========="
+            cat bootstrap.toml
+            echo "=============================================="
+          fi
+
+      # ------------------------------------------------------------
+      # 6. Build the repro-check tool
+      # ------------------------------------------------------------
+      - name: Build repro-check
+        id: build
+        run: |
+          cd "$WORKSPACE"
+          set +e
+          ./x.py build --stage 2 src/tools/repro-check -j "$(nproc)" 2>&1 | tee build.log
+          BUILD_STATUS=${PIPESTATUS[0]}
+          set -e
+
+          # If CI LLVM download failed, fallback to local build
+          if [[ $BUILD_STATUS -ne 0 ]] && grep -q "failed to download llvm from ci" build.log; then
+            echo "::warning::CI LLVM artifact missing. Falling back to local LLVM build..."
+            sed -i 's/download-ci-llvm = true/download-ci-llvm = false/' bootstrap.toml 2>/dev/null || true
+            echo -e "\n[llvm]\ndownload-ci-llvm = false\n" >> bootstrap.toml
+            ./x.py build --stage 2 src/tools/repro-check -j "$(nproc)"
+          elif [[ $BUILD_STATUS -ne 0 ]]; then
+            echo "::error::Build failed (not an LLVM download issue)."
+            exit 1
+          fi
+
+      # ------------------------------------------------------------
+      # 7. Locate the repro-check binary
+      # ------------------------------------------------------------
+      - name: Locate repro-check binary
+        run: |
+          cd "$WORKSPACE"
+          BIN=$(find build -path "*/stage1-tools-bin/repro-check" -print -quit)
+          [[ -z "$BIN" ]] && BIN=$(find build -path "*/stage2-tools-bin/repro-check" -print -quit)
+          if [[ -z "$BIN" ]]; then
+            echo "::error::repro-check binary not found!"
+            find build -type f -name repro-check -print || true
+            exit 1
+          fi
+          BIN=$(realpath "$BIN")
+          echo "repro_bin=$BIN" >> $GITHUB_ENV
+          echo "Found binary: $BIN"
+
+      # ------------------------------------------------------------
+      # 8. Run the reproducibility check
+      # ------------------------------------------------------------
+      - name: Run repro-check
+        id: repro
+        continue-on-error: true
+        run: |
+          cd "$WORKSPACE"
+          echo "Starting repro-check (this builds Stage 2 TWICE)..."
+          set +e
+          "$REPRO_BIN" \
+            --jobs "$(nproc)" \
+            --html-output repro_report.html \
+            --clean
+          EXITCODE=$?
+          set -e
+          echo "exitcode=$EXITCODE" >> $GITHUB_ENV
+          echo "repro-check exited with: $EXITCODE"
+
+      # ------------------------------------------------------------
+      # 9. Generate markdown report + GitHub job summary
+      # ------------------------------------------------------------
+      - name: Generate report
+        run: |
+          cd "$WORKSPACE"
+          SHA="${{ env.upstream_sha }}"
+          SHORT="${{ env.upstream_short }}"
+          REF="${{ env.upstream_ref }}"
+          NOW=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          LAST_GOOD="${{ steps.state.outputs.last_good }}"
+          LAST_DATE="${{ steps.state.outputs.last_date }}"
+          EXITCODE="${{ env.exitcode }}"
+          PATCH_METHOD="${{ env.patch_method }}"
+          LLVM_MODE="${{ inputs.download-ci-llvm || 'true' }}"
+
+          # Compute commit range
+          RANGE_INFO="N/A (no previous good run)"
+          COMMIT_COUNT="N/A"
+          if [[ -n "$LAST_GOOD" ]]; then
+            if git merge-base --is-ancestor "$LAST_GOOD" "$SHA" 2>/dev/null; then
+              COMMIT_COUNT=$(git rev-list --count "$LAST_GOOD..$SHA")
+              RANGE_INFO="$LAST_GOOD .. $SHORT ($COMMIT_COUNT commits)"
+            else
+              RANGE_INFO="Last good is not an ancestor (history was rewritten)"
+            fi
+          fi
+
+          # Determine result
+          if [[ "$EXITCODE" == "0" ]]; then
+            RESULT="✅ PASS — Builds are reproducible"
+            STATUS_EMOJI="✅"
+          else
+            RESULT="❌ FAIL — Builds are NOT reproducible"
+            STATUS_EMOJI="❌"
+          fi
+
+          # Write REPORT.md
+          cat > REPORT.md <<EOF
+          # Rust Reproducibility Check Report
+
+          | Field | Value |
+          |-------|-------|
+          | **Date & Time** | $NOW |
+          | **Upstream Ref** | \`$REF\` |
+          | **Upstream Commit** | [\`$SHA\`](https://github.com/rust-lang/rust/commit/$SHA) |
+          | **Last Known Good** | \`$LAST_GOOD\` ($LAST_DATE) |
+          | **Commit Range** | $RANGE_INFO |
+          | **download-ci-llvm** | $LLVM_MODE |
+          | **Patch Method** | $PATCH_METHOD |
+          | **Result** | $RESULT |
+          | **Workflow Run** | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} |
+
+          ## Artifacts
+          - \`repro_report.html\` — Detailed file-by-file comparison
+          - \`upstream-sha.txt\` — The exact commit tested
+          - \`build.log\` — Build output
+
+          EOF
+
+          # Also print to GitHub Step Summary (visible on the Actions run page)
+          cat >> $GITHUB_STEP_SUMMARY <<EOF
+          ## $STATUS_EMOJI Reproducibility Check: $RESULT
+
+          | | |
+          |---|---|
+          | **Upstream** | [\`$SHORT\`](https://github.com/rust-lang/rust/commit/$SHA) on \`$REF\` |
+          | **Commit Range** | $RANGE_INFO |
+          | **CI LLVM** | $LLVM_MODE |
+          | **Patch** | $PATCH_METHOD |
+
+          **Report:** Download \`repro_report.html\` from the Artifacts section below.
+
+          EOF
+
+          # Save upstream SHA to a file for artifact upload
+          echo "$SHA" > upstream-sha.txt
+
+      # ------------------------------------------------------------
+      # 10. Upload artifacts (auto-deleted after 7 days)
+      # ------------------------------------------------------------
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: repro-check-${{ env.upstream_short }}-${{ github.run_id }}
+          path: |
+            ${{ env.WORKSPACE }}/repro_report.html
+            ${{ env.WORKSPACE }}/REPORT.md
+            ${{ env.WORKSPACE }}/upstream-sha.txt
+            ${{ env.WORKSPACE }}/build.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # ------------------------------------------------------------
+      # 11. Update state file on SUCCESS
+      # ------------------------------------------------------------
+      - name: Save good state
+        if: steps.repro.outcome == 'success'
+        run: |
+          cat > "$STATE_DIR/last-good.json" <<EOF
+          {
+            "sha": "${{ env.upstream_sha }}",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "run_id": ${{ github.run_id }},
+            "ref": "${{ env.upstream_ref }}"
+          }
+          EOF
+          echo "State saved: ${{ env.upstream_sha }}"
+
+      # ------------------------------------------------------------
+      # 12. Bisect on failure
+      # ------------------------------------------------------------
+      - name: Auto-bisect on failure
+        if: steps.repro.outcome == 'failure' && inputs.enable-bisect != 'false'
+        run: |
+          BAD_SHA="${{ env.upstream_sha }}"
+          STATE_FILE="$STATE_DIR/last-good.json"
+
+          if [[ ! -f "$STATE_FILE" ]]; then
+            echo "::warning::No previous good run found. Cannot bisect."
+            exit 0
+          fi
+
+          GOOD_SHA=$(jq -r '.sha // empty' "$STATE_FILE")
+          if [[ -z "$GOOD_SHA" || "$GOOD_SHA" == "$BAD_SHA" ]]; then
+            echo "::warning::Cannot bisect: good=$GOOD_SHA bad=$BAD_SHA"
+            exit 0
+          fi
+
+          echo "Bisecting $GOOD_SHA .. $BAD_SHA"
+          cd "$WORKSPACE"
+
+          # Verify ancestry
+          if ! git merge-base --is-ancestor "$GOOD_SHA" "$BAD_SHA"; then
+            echo "::warning::Last good commit is not an ancestor of bad. Skipping bisect."
+            exit 0
+          fi
+
+          # Start bisect
+          git bisect start
+          git bisect bad "$BAD_SHA"
+          git bisect good "$GOOD_SHA"
+
+          set +e
+          git bisect run bash -c '
+            set -euo pipefail
+            HEAD_SHA=$(git rev-parse HEAD)
+            cleanup() {
+              git reset --hard "$HEAD_SHA" 2>/dev/null || true
+              git clean -ffdx 2>/dev/null || true
+            }
+            trap cleanup EXIT
+
+            # Try to apply patch at this historical commit
+            git remote add windsunil "'"$REPRO_REPO"'" 2>/dev/null || true
+            git fetch windsunil "'"$REPRO_BRANCH"'" --depth=1 2>/dev/null || true
+
+            # Try cherry-pick first
+            PR_C=$(git rev-parse windsunil/'"$REPRO_BRANCH"')
+            if git cherry-pick --no-commit "$PR_C" 2>/dev/null; then
+              : # ok
+            else
+              git cherry-pick --abort 2>/dev/null || true
+              git reset --hard "$HEAD_SHA"
+              git diff --full-index --binary "HEAD...windsunil/'"$REPRO_BRANCH"'" > /tmp/bisect.patch 2>/dev/null || true
+              if [[ -s /tmp/bisect.patch ]]; then
+                git apply /tmp/bisect.patch || { echo "SKIP: patch does not apply"; exit 125; }
+              else
+                echo "SKIP: empty patch"
+                exit 125
+              fi
+            fi
+            git remote remove windsunil 2>/dev/null || true
+
+            # Patch local LLVM if needed
+            if [[ "'"${{ inputs.download-ci-llvm || 'true' }}"'" == "false" && -f src/tools/repro-check/src/config.rs ]]; then
+              sed -i "s/download-ci-llvm = true/download-ci-llvm = false/" src/tools/repro-check/src/config.rs
+            fi
+
+            rm -rf build bootstrap.toml
+            ./x.py setup compiler >/dev/null 2>&1 || true
+
+            # Build repro-check
+            if ! ./x.py build --stage 2 src/tools/repro-check -j '"$(nproc)"' >/tmp/bisect-build.log 2>&1; then
+              if grep -q "failed to download llvm from ci" /tmp/bisect-build.log; then
+                echo -e "\n[llvm]\ndownload-ci-llvm = false\n" >> bootstrap.toml
+                ./x.py build --stage 2 src/tools/repro-check -j '"$(nproc)"' >/tmp/bisect-build2.log 2>&1 || { echo "SKIP: build failed"; exit 125; }
+              else
+                echo "SKIP: build failed"
+                exit 125
+              fi
+            fi
+
+            BIN=$(find build -path "*/stage1-tools-bin/repro-check" -print -quit)
+            [[ -z "$BIN" ]] && BIN=$(find build -path "*/stage2-tools-bin/repro-check" -print -quit)
+            [[ -z "$BIN" ]] && { echo "SKIP: binary missing"; exit 125; }
+
+            set +e
+            "$BIN" --jobs '"$(nproc)"' --html-output /tmp/bisect-report.html --clean >/tmp/bisect-run.log 2>&1
+            STATUS=$?
+            set -e
+            exit $STATUS
+          ' | tee bisect.log
+          BISECT_EXIT=${PIPESTATUS[0]}
+          set -e
+
+          git bisect reset
+
+          # Upload bisect log as artifact
+          mv bisect.log "$WORKSPACE/bisect.log" 2>/dev/null || true
+          echo "Bisect finished with exit: $BISECT_EXIT"
+
+      # ------------------------------------------------------------
+      # 13. Upload bisect log if present
+      # ------------------------------------------------------------
+      - name: Upload bisect artifact
+        if: steps.repro.outcome == 'failure' && inputs.enable-bisect != 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: repro-bisect-${{ env.upstream_short }}-${{ github.run_id }}
+          path: |
+            ${{ env.WORKSPACE }}/bisect.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # ------------------------------------------------------------
+      # 14. Cleanup workspace on server
+      # ------------------------------------------------------------
+      - name: Cleanup workspace
+        if: always()
+        run: |
+          echo "Cleaning up $WORKSPACE ..."
+          rm -rf "$WORKSPACE"
+          df -h
