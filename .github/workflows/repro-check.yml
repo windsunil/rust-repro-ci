@@ -91,39 +91,64 @@ jobs:
 
       # ------------------------------------------------------------
       # 4. Apply repro-check patch from PR #149888
+      #    Cargo.lock conflicts are handled by excluding it and regenerating
       # ------------------------------------------------------------
       - name: Apply repro-check patch from PR
         run: |
           cd "$WORKSPACE"
           echo "Downloading PR #149888 diff..."
-          curl -L -o /tmp/repro-check.patch "$PR_DIFF_URL"
+          curl -sL -o /tmp/repro-check-full.patch "$PR_DIFF_URL"
 
-          if [[ ! -s /tmp/repro-check.patch ]]; then
-            echo "::error::Failed to download PR diff. PR may have been closed or GitHub is unreachable."
+          if [[ ! -s /tmp/repro-check-full.patch ]]; then
+            echo "::error::Failed to download PR diff."
             exit 1
           fi
 
-          echo "Patch file size: $(wc -c < /tmp/repro-check.patch) bytes"
+          echo "Full patch size: $(wc -l < /tmp/repro-check-full.patch) lines"
 
-          echo "Trying to apply patch..."
-          if git apply --check /tmp/repro-check.patch 2>/dev/null; then
-            git apply /tmp/repro-check.patch
-            echo "::notice::Patch applied successfully"
-            echo "patch_method=pr-diff" >> $GITHUB_ENV
+          # ------------------------------------------------------------------
+          # METHOD 1: Try applying the full patch first (might work if PR is fresh)
+          # ------------------------------------------------------------------
+          echo "Trying full patch apply..."
+          if git apply --check /tmp/repro-check-full.patch 2>/dev/null; then
+            git apply /tmp/repro-check-full.patch
+            echo "::notice::Full patch applied cleanly"
+            echo "patch_method=full-diff" >> $GITHUB_ENV
           else
-            echo "::warning::Direct apply failed. Trying with 3-way merge..."
-            if git apply --3way /tmp/repro-check.patch; then
-              echo "::notice::Patch applied with 3-way merge"
-              echo "patch_method=pr-diff-3way" >> $GITHUB_ENV
+            # ----------------------------------------------------------------
+            # METHOD 2: Exclude Cargo.lock and try again
+            # ----------------------------------------------------------------
+            echo "Full patch failed (likely Cargo.lock conflict). Trying without Cargo.lock..."
+            grep -v '^ Cargo.lock' /tmp/repro-check-full.patch > /tmp/repro-check-nolock.patch || true
+
+            if git apply --check /tmp/repro-check-nolock.patch 2>/dev/null; then
+              git apply /tmp/repro-check-nolock.patch
+              echo "::notice::Patch applied (Cargo.lock excluded)"
+              echo "patch_method=diff-exclude-lock" >> $GITHUB_ENV
+
+              # Regenerate Cargo.lock for the new tool
+              echo "Regenerating Cargo.lock for repro-check..."
+              cd src/tools/repro-check
+              cargo generate-lockfile 2>/dev/null || true
+              cd "$WORKSPACE"
+
+              # Or let bootstrap handle it
+              echo "Lockfile will be finalized by bootstrap during build"
             else
-              echo "::error::FAILED to apply PR #149888 patch to current upstream main."
-              echo "The PR has merge conflicts and needs rebasing by the author."
-              echo ""
-              echo "To fix this, the PR branch must be rebased on top of rust-lang/rust:main"
-              exit 1
+              # ----------------------------------------------------------------
+              # METHOD 3: 3-way merge attempt
+              # ----------------------------------------------------------------
+              echo "Still failing. Trying 3-way merge..."
+              if git apply --3way /tmp/repro-check-full.patch; then
+                echo "::notice::Patch applied with 3-way merge"
+                echo "patch_method=3way-merge" >> $GITHUB_ENV
+              else
+                echo "::error::FAILED to apply PR #149888 patch."
+                echo "Non-lockfile conflicts exist. The PR needs manual rebasing."
+                exit 1
+              fi
             fi
           fi
-
       # ------------------------------------------------------------
       # 5. Configure build (toggle CI LLVM)
       # ------------------------------------------------------------
