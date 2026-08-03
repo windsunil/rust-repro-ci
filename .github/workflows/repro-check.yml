@@ -344,7 +344,7 @@ jobs:
       # 11. Update state file on SUCCESS
       # ------------------------------------------------------------
       - name: Save good state
-        if: steps.repro.outcome == 'success'
+        if: env.exitcode == '0'
         run: |
           cat > "$STATE_DIR/last-good.json" <<EOF
           {
@@ -360,7 +360,7 @@ jobs:
       # 12. Bisect on failure
       # ------------------------------------------------------------
       - name: Auto-bisect on failure
-        if: steps.repro.outcome == 'failure' && inputs.enable-bisect != 'false'
+        if: env.exitcode != '0' && inputs.enable-bisect != 'false'
         run: |
           BAD_SHA="${{ env.upstream_sha }}"
           STATE_FILE="$STATE_DIR/last-good.json"
@@ -463,7 +463,7 @@ jobs:
       # 13. Upload bisect log if present
       # ------------------------------------------------------------
       - name: Upload bisect artifact
-        if: steps.repro.outcome == 'failure' && inputs.enable-bisect != 'false'
+        if: env.exitcode != '0' && inputs.enable-bisect != 'false'
         uses: actions/upload-artifact@v4
         with:
           name: repro-bisect-${{ env.upstream_short }}-${{ github.run_id }}
