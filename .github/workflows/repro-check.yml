@@ -244,6 +244,7 @@ jobs:
           set -e
           echo "exitcode=$EXITCODE" >> $GITHUB_ENV
           echo "repro-check exited with: $EXITCODE"
+          exit $EXITCODE
 
       # ------------------------------------------------------------
       # 9. Generate markdown report + GitHub job summary
